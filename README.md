@@ -70,10 +70,11 @@ claims the token; otherwise it stays byte-for-byte your original binding.
 ## Commands
 
 ```
-ariadne stats      # entries, tool coverage, latency, learned weights
+ariadne stats      # entries, tool coverage (per source), latency, learned weights
 ariadne doctor     # health check with real latency measurement
+ariadne import [file]    # import zsh/bash/fish history (default: all found)
 ariadne bench 5000 # latency distribution
-ariadne harvest    # rescan $PATH for tool specs now
+ariadne harvest    # rescan $PATH for tool specs now (incl. LLM synthesis)
 ariadne train      # force a ranker training round
 ariadne forget <regex>   # permanently delete matching history (memory + disk)
 ariadne query <buf>      # what would be suggested for this buffer
@@ -175,8 +176,9 @@ zsh (ZLE) / bash (readline)  ──unix socket, text proto──▶  ariadned (G
   fall through to native                           JSONL log + gob snapshot (Store iface)
 ```
 
-Full design rationale and the corrections to the original brief are in
-`ariadne-architecture.md`.
+The design rationale lives in the package doc comments — start with
+`internal/daemon/daemon.go` (ownership, ingest) and `internal/rank/rank.go`
+(features, FTRL trainer).
 
 ---
 
@@ -196,8 +198,16 @@ Full design rationale and the corrections to the original brief are in
   records that carapace covers a tool but delegates dynamic value completion to
   the shell.
 - The **panel may not earn its place**. Ghost text is nearly free; a 3-line
-  panel above every prompt costs attention. Acceptance-by-rank is tracked in
-  `stats` — if rows 2 and 3 are rarely chosen, set `ARIADNE_PANEL_LINES=0`.
+  panel below every prompt costs attention (and, in bash, a few scrollback
+  rows per command). Acceptance-by-rank is tracked in `stats` — if rows 2
+  and 3 are rarely chosen, set `ARIADNE_PANEL_LINES=0`.
+- **Subcommand suggestions fire only at a fresh token** (`tool ␣<TAB>`), not
+  on a typed prefix (`tool ch<TAB>`). This applies to every spec source,
+  not just LLM-synthesized ones.
+- **LLM-synthesized specs can hallucinate** despite strict name validation —
+  treat their flags as hints, and prefer endpoints you control. Synthesis is
+  off by default and incremental (up to `ARIADNE_LLM_MAXTOOLS` per 12h
+  harvest), so coverage of the long tail improves over days, not instantly.
 - The **dumbest version** (trie + cwd-frecency, no ML) already captures much of
   the value. The learned ranker has to beat that baseline on your data to
   justify itself; `stats` shows whether it does.
