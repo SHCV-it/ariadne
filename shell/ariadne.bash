@@ -113,11 +113,16 @@ _ariadne_connect() {
   _ARIADNE_LAST_CONNECT_TRY=$EPOCHSECONDS
   _ariadne_drop
   [[ -S $ARIADNE_SOCKET ]] || return 1
+  # Interactive bash announces every coprocess ("[1] 19349") and its death
+  # on the terminal. The stderr redirect suppresses the creation notice;
+  # disown prevents the later Done/Exit notices. The bridge's own pipes are
+  # unaffected — only the job-table noise is silenced.
   case $_ARIADNE_BRIDGE in
-    socat) coproc ARIADNE_NC { socat - "UNIX-CONNECT:$ARIADNE_SOCKET" 2>/dev/null; } ;;
-    ncat)  coproc ARIADNE_NC { ncat --unix "$ARIADNE_SOCKET" 2>/dev/null; } ;;
-    *)     coproc ARIADNE_NC { nc -N -U "$ARIADNE_SOCKET" 2>/dev/null; } ;;
+    socat) { coproc ARIADNE_NC { socat - "UNIX-CONNECT:$ARIADNE_SOCKET" 2>/dev/null; } ; } 2>/dev/null ;;
+    ncat)  { coproc ARIADNE_NC { ncat --unix "$ARIADNE_SOCKET" 2>/dev/null; } ; } 2>/dev/null ;;
+    *)     { coproc ARIADNE_NC { nc -N -U "$ARIADNE_SOCKET" 2>/dev/null; } ; } 2>/dev/null ;;
   esac
+  disown 2>/dev/null
   _ARIADNE_RFD=${ARIADNE_NC[0]}
   _ARIADNE_WFD=${ARIADNE_NC[1]}
   _ARIADNE_NC_PID=$ARIADNE_NC_PID
