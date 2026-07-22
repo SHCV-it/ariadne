@@ -1,0 +1,36 @@
+[Unit]
+Description=Ariadne terminal completion daemon
+Documentation=man:ariadne(1)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ariadned
+Restart=on-failure
+RestartSec=2
+
+# The daemon holds your shell history. Confine it accordingly. These also
+# provide the process sandbox the harvester needs when it shells out to
+# systemd-run for --help scraping.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# StateDirectory both creates the data dir on first install and whitelists it
+# for writing; ReadWritePaths alone fails namespace setup when it is missing.
+StateDirectory=ariadne
+ReadWritePaths=%h/.local/share/ariadne
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

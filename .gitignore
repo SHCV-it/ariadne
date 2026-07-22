@@ -1,0 +1,8 @@
+# tooling index cache
+.codegraph/
+
+# local build outputs (release artifacts live in dist/)
+/ariadne
+/ariadned
+*.test
+*.out

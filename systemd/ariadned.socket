@@ -1,0 +1,10 @@
+[Unit]
+Description=Ariadne completion daemon socket
+
+[Socket]
+ListenStream=%t/ariadne.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
