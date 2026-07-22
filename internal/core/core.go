@@ -224,37 +224,73 @@ func TokenAt(toks []Token, cursor int) (idx int, fresh bool) {
 
 // ---------------- Redaction ----------------
 
-var redactors = []*regexp.Regexp{
+// prefixRedactors preserve the captured prefix (flag name, auth header) and
+// scrub only the value after it.
+var prefixRedactors = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(--?(?:password|passwd|pass|token|secret|api[-_]?key|auth)[= ])\S+`),
-	regexp.MustCompile(`(?i)(-p)[^\s-]\S*`),
 	regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`),
 	regexp.MustCompile(`(?i)((?:AWS|GITHUB|GITLAB|OPENAI|ANTHROPIC|HF)_[A-Z_]*(?:TOKEN|KEY|SECRET)=)\S+`),
-	regexp.MustCompile(`\b(gh[pousr]_[A-Za-z0-9]{16,})\b`),
-	regexp.MustCompile(`\b(sk-[A-Za-z0-9_\-]{20,})\b`),
-	regexp.MustCompile(`\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b`),
+}
+
+// fullRedactors match the secret itself; there is no prefix worth keeping.
+// (Previously these captured the whole secret and replaced it with
+// ${1}<redacted> — i.e. they kept the secret verbatim and only marked it.)
+var fullRedactors = []*regexp.Regexp{
+	regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{16,}\b`),
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_\-]{20,}\b`),
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b`),
+}
+
+// entropyRedactors catch unstructured high-entropy blobs; the path check runs
+// per match, so they live outside the two slices above.
+var entropyRedactors = []*regexp.Regexp{
 	regexp.MustCompile(`\b([A-Za-z0-9+/]{40,}={0,2})\b`), // high-entropy blob
 	regexp.MustCompile(`\b([0-9a-fA-F]{40,})\b`),
 }
 
 const RedactMark = "<redacted>"
 
+// dashPToken matches mysql-style attached passwords (-pSecret). The old rule
+// was `(-p)[^\s-]\S*`, which fired on every hyphenated word containing
+// "-p<letter>" — "neuromark-core-pipeline", "single-page" — and on the
+// most common docker/ssh invocations (-p8080, -p 8080:80). Those commands
+// were scrubbed and, being scrubbed, never suggested again. The flag must
+// now start a token, and the value must contain a letter to count as a
+// password; -p8080 is a port, not a credential.
+var dashPToken = regexp.MustCompile(`(^|\s)(-p)([A-Za-z0-9_=-]{2,})`)
+
+const dashPLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func redactDashP(s string) string {
+	return dashPToken.ReplaceAllStringFunc(s, func(m string) string {
+		sub := dashPToken.FindStringSubmatch(m)
+		if !strings.ContainsAny(sub[3], dashPLetters) {
+			return m
+		}
+		return sub[1] + sub[2] + RedactMark
+	})
+}
+
 // Redact scrubs credentials. Returns the scrubbed string and whether anything
 // was removed. Redacted commands are stored but never offered verbatim.
 func Redact(s string) (string, bool) {
 	out := s
-	for i, re := range redactors {
-		if i >= len(redactors)-2 {
-			// Entropy heuristics: skip if the whole token looks like a path.
-			out = re.ReplaceAllStringFunc(out, func(m string) string {
-				if strings.ContainsAny(m, "/.") {
-					return m
-				}
-				return RedactMark
-			})
-			continue
-		}
+	for _, re := range prefixRedactors {
 		out = re.ReplaceAllString(out, "${1}"+RedactMark)
 	}
+	for _, re := range fullRedactors {
+		out = re.ReplaceAllString(out, RedactMark)
+	}
+	for _, re := range entropyRedactors {
+		// Entropy heuristics: skip if the whole token looks like a path.
+		out = re.ReplaceAllStringFunc(out, func(m string) string {
+			if strings.ContainsAny(m, "/.") {
+				return m
+			}
+			return RedactMark
+		})
+	}
+	out = redactDashP(out)
 	return out, out != s
 }
 
