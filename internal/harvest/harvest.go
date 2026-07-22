@@ -357,14 +357,18 @@ func packageOwned(path string) bool {
 // runHelpSandboxed executes <bin> --help under the tightest confinement
 // available. Executing arbitrary binaries from $PATH to scrape their help text
 // is a real code-execution surface; it gets a sandbox or it does not run.
+//
+// Both sandboxes are attempted: the daemon's own unit sets
+// RestrictNamespaces=yes, which blocks bwrap's unshare but not systemd-run
+// (the manager builds the sandbox on our behalf over D-Bus). Conversely
+// systemd-run may be missing on non-systemd hosts.
 func runHelpSandboxed(ctx context.Context, path string, timeout time.Duration) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, timeout+time.Second)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	switch {
-	case has("bwrap"):
-		cmd = exec.CommandContext(cctx, "bwrap",
+	var cmds []*exec.Cmd
+	if has("bwrap") {
+		cmds = append(cmds, exec.CommandContext(cctx, "bwrap",
 			"--ro-bind", "/usr", "/usr",
 			"--ro-bind-try", "/etc", "/etc",
 			"--symlink", "usr/bin", "/bin",
@@ -374,26 +378,30 @@ func runHelpSandboxed(ctx context.Context, path string, timeout time.Duration) (
 			"--tmpfs", "/home", "--tmpfs", "/tmp", "--tmpfs", "/root",
 			"--unshare-all", "--die-with-parent", "--new-session",
 			"--setenv", "HOME", "/tmp",
-			"--", "timeout", "-k", "1", trimSec(timeout), path, "--help")
-	case has("systemd-run"):
-		cmd = exec.CommandContext(cctx, "systemd-run", "--user", "--scope", "--quiet", "--pipe",
+			"--", "timeout", "-k", "1", trimSec(timeout), path, "--help"))
+	}
+	if has("systemd-run") {
+		// A transient *service*, not a scope: --pipe/--pty are rejected for
+		// scope units on systemd >= 256, so output capture requires this form.
+		cmds = append(cmds, exec.CommandContext(cctx, "systemd-run",
+			"--user", "--quiet", "--pipe", "--collect",
 			"-p", "PrivateNetwork=yes", "-p", "ProtectHome=yes",
 			"-p", "ProtectSystem=strict", "-p", "NoNewPrivileges=yes",
 			"-p", "MemoryMax=256M",
-			"--", "timeout", "-k", "1", trimSec(timeout), path, "--help")
-	default:
+			"--", "timeout", "-k", "1", trimSec(timeout), path, "--help"))
+	}
+	if len(cmds) == 0 {
 		// No sandbox available: refuse. A missing sandbox is not a reason to
 		// execute unknown binaries; it is a reason to skip this source.
 		return "", false
 	}
-	cmd.Stdin = nil
-	out, err := cmd.Output()
-	if len(out) < 40 {
-		if err != nil {
-			return "", false
+	for _, cmd := range cmds {
+		cmd.Stdin = nil
+		if out, _ := cmd.Output(); len(out) >= 40 {
+			return string(out), true
 		}
 	}
-	return string(out), len(out) >= 40
+	return "", false
 }
 
 func has(bin string) bool { _, err := exec.LookPath(bin); return err == nil }
