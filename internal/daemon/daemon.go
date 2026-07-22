@@ -560,7 +560,13 @@ func (d *Daemon) generate(ix *index.Index, typed, rawBuf string, ctx *rank.Conte
 				prefixTok := curTok
 				for _, fl := range spec.FlagsFor(sub) {
 					disp := fl.Display()
-					if disp == "" || !strings.HasPrefix(disp, prefixTok) {
+					if disp == "" {
+						continue
+					}
+					// Match the typed prefix against either written form: a
+					// user who types -t should still be offered --tty.
+					if !strings.HasPrefix(disp, prefixTok) &&
+						!(fl.Short != "" && strings.HasPrefix(fl.Short, prefixTok)) {
 						continue
 					}
 					full := rawBuf[:toks[tokIdx].Start] + disp
