@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -148,5 +149,32 @@ func TestLLMPreflightPicksModel(t *testing.T) {
 	}
 	if opt.Model != "auto-model" {
 		t.Fatalf("model not auto-picked: %q", opt.Model)
+	}
+}
+
+func TestBinaryChanged(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	info, _ := os.Stat(f.Name())
+	mtime := info.ModTime().Unix()
+
+	if binaryChanged(f.Name(), mtime) {
+		t.Fatal("unchanged binary reported changed")
+	}
+	if !binaryChanged(f.Name(), mtime+3600) {
+		t.Fatal("mtime bump not detected")
+	}
+	past := time.Unix(mtime-3600, 0)
+	if err := os.Chtimes(f.Name(), past, past); err != nil {
+		t.Fatal(err)
+	}
+	if !binaryChanged(f.Name(), mtime) {
+		t.Fatal("real mtime change not detected")
+	}
+	if !binaryChanged(f.Name()+"-missing", mtime) {
+		t.Fatal("missing binary must report changed (resynthesize, don't trust)")
 	}
 }

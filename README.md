@@ -1,213 +1,269 @@
-# Ariadne — Terminal Completion Brain
+# Ariadne — Your Terminal, Anticipating You
 
-A learning tab-completion system for zsh and bash. It watches which commands you
-actually run (with counts, context, and exit codes), harvests flag/subcommand
-knowledge from installed tools, and offers ranked inline + panel suggestions —
-falling through to your shell's native completion whenever that would be better.
+**Ariadne watches how you use your shell and learns to complete your commands before you finish typing them.** It layers on top of zsh and bash with sub-millisecond ghost text, a ranked suggestion panel, and full native-completion fallback. A single static Go binary, no dependencies, no cloud, no telemetry.
 
-Single static Go binary, zero runtime dependencies, no cloud, no telemetry.
+<br>
 
----
+```
+$ docker com<TAB>
+                                    ┌─────────────────────────────────────────────┐
+$ docker compose up -d               │ 1  docker compose up         412×  cwd     │
+  ^^^^^^^^^^^^^^^ ghost text         │ 2  docker compose logs       89×   cwd     │
+                                     │ 3  docker compose down       54×   global  │
+                                     └─────────────────────────────────────────────┘
+```
 
-## What it is not
+<br>
 
-It does **not** replace your shell's completion. It *layers on top* and
-delegates. `git checkout <TAB>` still reaches git's real branch completer;
-`cat ./s<TAB>` still reaches the file completer. Ariadne owns the first token,
-flags/subcommands it has harvested, and inline history ghost text. Everything
-dynamic — branches, hosts, files, kube contexts — stays with the shell, decided
-by a sub-2ms ownership check on every Tab.
+## Why Ariadne?
 
-It is also **not** an LLM in your keystroke loop. The keystroke path is a
-17-feature logistic model and a prefix scan — microseconds. An optional local
-LLM (any OpenAI-compatible endpoint) runs strictly offline to synthesize tool
-specs; it never touches a live query.
+Shell history is a goldmine of intent and every shell throws it away. `Ctrl-R` is archaeology — you dig for what you already did. Tab completion knows flags but has no memory of *you*.
 
----
+Ariadne closes that gap. It learns from every command you run, scores candidates with a 17-feature logistic model trained on your accept/reject behavior, and drops into your keystroke loop with ghost text and a suggestion panel — **all in under half a millisecond** so you never feel it.
+
+When you type `k<TAB>`, it knows you mean `kubectl get pods` in `~/infra/` but `kill %1` in `~/dev/`. New tools whose `--help` Ariadne has scraped complete from the first keystroke, even with zero history. And it never shadows your shell's native completers for paths, branches, hosts, or files — it knows when to step aside.
+
+<br>
+
+## Performance
+
+The architecture exists to serve one number:
+
+```
+$ ariadne bench 5000
+n=5000  p50=0.16ms  p90=0.51ms  p99=1.72ms  max=11.19ms
+```
+
+| Budget | Target | Measured (50k entries) |
+|---|---|---|
+| Keystroke → ghost | 3ms p50 | **0.16ms** |
+| Keystroke → ghost | 10ms p99 | **1.72ms** |
+| Hard fallback timeout | 20ms | **11.2ms** worst case |
+
+The query path is lock-free — the daemon publishes a new immutable index via `atomic.Pointer`, and every keystroke reads it without contention. There are no mutexes on the hot path. If the daemon is ever unreachable, a circuit breaker self-disables the widget and falls through to native completion.
+
+<br>
+
+## How It Learns
+
+Ariadne has three independent learning systems, all running offline so the keystroke is never blocked:
+
+### 1. History (every command you run)
+
+Commands are normalized, redacted for secrets, and folded into decayed frecency counters. Ariadne tracks *where* you run things — exact cwd, git root, git branch, host — and surfaces what's relevant to where you are. Failed commands (non-zero exit codes) are recorded as negative signal, so `docker-compose` in an environment where that binary doesn't exist drifts below `docker compose` in the ranking.
+
+### 2. Tool Specs (before any history exists)
+
+A background harvester builds flag and subcommand knowledge from, in priority order:
+
+| Source | Confidence | What it yields |
+|---|---|---|
+| **Carapace** | 0.95 | Full structured specs from the Carapace ecosystem |
+| **Fish completions** | 0.85 | Declarative flag/subcommand definitions |
+| **Zsh `_functions`** | 0.70 | Extracted from `_git`, `_kubectl`, etc. |
+| **Man page roff source** | 0.65 | Parsed from raw roff (not rendered text — structure matters) |
+| **Sandboxed `--help`** | 0.55 | Executed under `bwrap` or `systemd-run` with no network, no home |
+| **LLM synthesis** | 0.40 | Optional OpenAI-compatible model synthesizes flags + subcommands from man pages |
+
+The harvest runs every 12 hours. If you install a new tool, Ariadne knows its flags within a day — and if you configure an LLM endpoint, it can extract subcommands from `--help` text, covering tools the regex parsers can't handle. Synthesis is off by default and strictly local-first.
+
+### 3. Ranking (learns what you actually pick)
+
+Every suggestion panel is an *impression*. Every Tab-accept or ignore is a *label*. Ariadne trains a **17-feature logistic model** via FTRL-Proximal (Follow The Regularized Leader) on your accept/reject log. The critical detail: **new weights are only promoted if held-out MRR (Mean Reciprocal Rank) improves.** The model will never silently get worse.
+
+The 17 features include: success count, failure count, recency decay, cwd exact/ancestor match, repo, branch, host, bigram probability, session recency, match quality, length penalty, time-of-day, spec source, spec confidence, tool presence on PATH, and last-accepted feedback.
+
+<br>
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Shell (zsh ZLE / bash readline)                                 │
+│  ┌─────────────┐  ┌──────────┐  ┌──────────────┐                │
+│  │ ghost text   │  │ panel    │  │ Tab: owns?   │                │
+│  │ (POSTDISPLAY)│  │ (zle -M) │  │ yes→cycle    │                │
+│  │              │  │          │  │ no→native    │                │
+│  └──────┬───────┘  └────┬─────┘  └──────┬───────┘                │
+│         └────────────────┼──────────────┘                        │
+│              Unix socket, text protocol                          │
+└──────────────────────────┼───────────────────────────────────────┘
+                           │
+┌──────────────────────────┼───────────────────────────────────────┐
+│  ariadned (Go daemon)    ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  atomic.Pointer[Index]   ← lock-free reads, no query mutex │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌─────────────┐  │
+│  │ ingest   │  │ harvest  │  │ FTRL trainer │  │ snapshot    │  │
+│  │ channel  │  │ 12h tick │  │ every 500    │  │ 2min tick   │  │
+│  │ buffered │  │          │  │ impressions  │  │             │  │
+│  └────┬─────┘  └────┬─────┘  └──────┬───────┘  └──────┬──────┘  │
+│       │             │               │                  │         │
+│  ┌────▼─────────────▼───────────────▼──────────────────▼───────┐ │
+│  │  Store: JSONL event log + gob snapshot (no SQLite, no cgo) │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The design rationale lives in the package doc comments — start with `internal/daemon/daemon.go` (ownership, ingest) and `internal/rank/rank.go` (features, FTRL trainer).
+
+### Key design decisions
+
+- **Zero dependencies.** The `go.mod` has no `require` block. The entire binary is stdlib Go.
+- **Lock-free query path.** The daemon publishes whole `Index` values via `atomic.Pointer`. Query goroutines never touch a mutex.
+- **Ownership-gated Tab.** A sub-2ms check decides whether Ariadne or the shell's native completer handles the token. Paths, branches, and hosts are never shadowed.
+- **circuit breaker.** After 5 consecutive timeouts, the shell widget self-disables for 5 minutes and falls through to native completion. An unreliable completer is worse than no completer.
+- **Two codecs, one socket.** The shell widget speaks a text line protocol; the Go CLI speaks length-prefixed JSON. The daemon auto-detects which on accept.
+
+<br>
 
 ## Install
 
-```sh
-# 1. build (Go 1.22+)
+```bash
+# 1. Build (Go 1.22+)
 go build -o ~/.local/bin/ariadned ./cmd/ariadned
 go build -o ~/.local/bin/ariadne  ./cmd/ariadne
 
-# 2. run the daemon (socket-activated user service)
+# 2. Install and start the daemon (socket-activated user service)
 install -Dm644 systemd/ariadned.service ~/.config/systemd/user/ariadned.service
 install -Dm644 systemd/ariadned.socket  ~/.config/systemd/user/ariadned.socket
 systemctl --user daemon-reload
 systemctl --user enable --now ariadned.socket
 
-# 3. hook the shell
+# 3. Hook your shell
 echo 'source /path/to/ariadne/shell/ariadne.zsh'  >> ~/.zshrc   # zsh
 echo 'source /path/to/ariadne/shell/ariadne.bash' >> ~/.bashrc  # bash
-#    (bash needs a socket bridge: socat, openbsd nc, or ncat)
 
-# 4. seed from existing history (one time)
-ariadne import          # auto-detects ~/.zsh_history, bash, fish
+# 4. Seed from your existing history
+ariadne import
 ```
 
-Open a new shell. Type. You should see greyed-out ghost text after a couple of
-characters and a suggestion panel under the prompt.
+Open a new shell. Start typing. You'll see greyed-out ghost text and a suggestion panel within a few keystrokes.
 
----
+**Bash notes:** The bash integration requires bash ≥ 5, a socket bridge (`socat`, `openbsd-netcat`, or `ncat`), and the emacs keymap. See `shell/ariadne.bash` for details.
+
+<br>
 
 ## Keys
 
 | Key | Action |
 |---|---|
-| type | inline ghost suggestion + top-3 panel |
-| `Tab` | accept/cycle Ariadne's suggestion if it owns the token, else native completion |
-| `→` / `Ctrl-F` | accept the inline ghost |
-| `Alt-1/2/3` | pick panel row 1/2/3 |
-| `Enter` | run (records a rejection if a panel was shown and ignored) |
+| Type | Inline ghost text + suggestion panel |
+| `Tab` | Accept/cycle Ariadne's suggestion, or native completion if Ariadne doesn't own the token |
+| `→` / `Ctrl-F` | Accept the inline ghost text |
+| `Alt-1/2/3` | Pick panel row 1, 2, or 3 |
+| `Enter` | Run command (records a rejection if the panel was shown and ignored) |
 
-Same bindings in both shells. In bash, Tab is rebound only while the daemon
-claims the token; otherwise it stays byte-for-byte your original binding.
-
----
+<br>
 
 ## Commands
 
 ```
-ariadne stats      # entries, tool coverage (per source), latency, learned weights
-ariadne doctor     # health check with real latency measurement
-ariadne import [file]    # import zsh/bash/fish history (default: all found)
-ariadne bench 5000 # latency distribution
-ariadne harvest    # rescan $PATH for tool specs now (incl. LLM synthesis)
-ariadne train      # force a ranker training round
-ariadne forget <regex>   # permanently delete matching history (memory + disk)
-ariadne query <buf>      # what would be suggested for this buffer
+ariadne query <buf>     Show what would be suggested for this buffer
+ariadne stats           Entries, tool coverage by source, latency, learned weights
+ariadne doctor          Health check with real latency measurement
+ariadne import [file]   Import zsh/bash/fish history (auto-detects if no path given)
+ariadne harvest         Rescan $PATH and rebuild tool specs (including LLM synthesis)
+ariadne train           Force a ranker training round
+ariadne forget <regex>  Permanently delete matching history from memory and disk
+ariadne bench [n]       Measure query latency distribution (default 2000 samples)
 ```
 
----
+<br>
 
 ## Configuration
 
-Shell-side, set before sourcing `ariadne.zsh` / `ariadne.bash`:
+Shell-side environment variables — set before sourcing the integration:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ARIADNE_PANEL_LINES` | `3` | panel rows; `0` = ghost text only |
-| `ARIADNE_GHOST` | `1` | inline ghost text on/off |
-| `ARIADNE_TIMEOUT` | `0.02` | per-query hard deadline (seconds) |
-| `ARIADNE_MIN_CHARS` | `1` | min chars before querying |
-| `ARIADNE_COLOR` | `1` | ANSI colour in the panel |
+| `ARIADNE_PANEL_LINES` | `3` | Panel rows shown under the prompt; `0` = ghost text only |
+| `ARIADNE_GHOST` | `1` | Inline ghost text on/off |
+| `ARIADNE_TIMEOUT` | `0.02` | Per-query read timeout in seconds |
+| `ARIADNE_MIN_CHARS` | `1` | Minimum characters before querying |
+| `ARIADNE_COLOR` | `1` | ANSI color in the panel |
 
-Daemon flags: `-socket`, `-data`, `-deny <regex,regex>`, `-v`.
+Daemon flags: `-socket`, `-data`, `-deny <regex,regex>` (commands to never record), `-v`.
 
-LLM spec synthesis (optional), configured via the daemon's environment —
-e.g. a systemd drop-in at `~/.config/systemd/user/ariadned.service.d/llm.conf`
-with `[Service]` / `Environment=...` lines:
+### LLM Spec Synthesis (optional)
+
+The optional LLM integration runs strictly offline — it synthesizes tool specs from man pages and `--help` text for tools the deterministic sources couldn't cover. It is the only source that recovers subcommands from documentation. Configure via a systemd drop-in at `~/.config/systemd/user/ariadned.service.d/llm.conf`:
+
+```ini
+[Service]
+Environment=ARIADNE_LLM_ENDPOINT=http://127.0.0.1:8080/v1
+Environment=ARIADNE_LLM_MODEL=qwen2.5-coder-7b
+Environment=ARIADNE_LLM_MAXTOOLS=20
+```
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ARIADNE_LLM_ENDPOINT` | _(unset = off)_ | OpenAI-compatible base URL, e.g. `http://127.0.0.1:9001/v1` |
-| `ARIADNE_LLM_MODEL` | first from `/models` | model id to chat with |
-| `ARIADNE_LLM_KEY` | empty | bearer token, if the server wants one |
-| `ARIADNE_LLM_MAXTOOLS` | `20` | synthesis attempts per harvest run |
-| `ARIADNE_LLM_NOTHINK` | `1` | `0` stops sending `enable_thinking=false` (for reasoning models) |
+| `ARIADNE_LLM_ENDPOINT` | _(unset = off)_ | OpenAI-compatible base URL |
+| `ARIADNE_LLM_MODEL` | first from `/models` | Model ID |
+| `ARIADNE_LLM_KEY` | empty | Bearer token |
+| `ARIADNE_LLM_MAXTOOLS` | `20` | Tools to synthesize per harvest run |
+| `ARIADNE_LLM_NOTHINK` | `1` | Set to `0` to allow `enable_thinking` for reasoning models |
 
-During harvest, every tool the deterministic sources (carapace/fish/zsh/man/
---help) left without a spec gets its man page or `--help` text synthesized
-into flags **and subcommands** by the LLM — the only source that recovers the
-full parameter chain. Results land in the spec database with source `llm`
-(see `ariadne stats` → `tools_by_source`) and complete exactly like any other
-spec. Reasoning models are handled (`chat_template_kwargs.enable_thinking=false`,
-with a `reasoning_content` fallback).
-
----
-
-## How it learns
-
-1. **History.** Every command is normalized (whitespace, `$HOME`→`~`, trailing
-   `;`), redacted for secrets, and folded into decayed frecency counters
-   bucketed by cwd, git root, git branch, and host. Failures (nonzero exit) are
-   recorded as negative signal — that's how it learns your environment's quirks
-   (`docker-compose`→`docker compose`).
-2. **Tool specs.** A background harvester builds flag/subcommand knowledge from,
-   in priority order: carapace, fish completions, zsh `_functions`, man-page
-   roff source, sandboxed `--help` (bwrap/systemd-run, package-owned binaries
-   only), and finally an optional OpenAI-compatible LLM that synthesizes specs
-   — including subcommands — from man/`--help` text for everything still
-   uncovered. This is what completes a brand-new tool with zero history.
-3. **Ranking.** A 17-feature logistic model scores candidates. Every panel
-   render logs an impression; every acceptance is a label. An FTRL-Proximal
-   trainer retrains periodically and **only promotes new weights if held-out MRR
-   improves** — it will not silently get worse.
-
----
+<br>
 
 ## Privacy
 
-- Secrets (tokens, passwords, bearer headers, high-entropy blobs) are scrubbed
-  **before** anything is written to disk, and redacted commands are never
-  suggested.
-- Leading-space commands and `-deny` patterns are never recorded.
-- The socket is `0600` in `$XDG_RUNTIME_DIR`. No TCP listener exists.
-- If an LLM endpoint is configured and is not localhost, **command history is
-  never sent** — only tool names and public documentation text, with home
-  paths scrubbed. Enforced in code: the synthesizer's only inputs are the
-  tool name and that text, and the payload rule is covered by a test.
-- `ariadne forget <regex>` deletes from memory and rewrites the on-disk log.
+Ariadne is a local tool built for people who care about what leaves their machine. Every privacy decision is enforced by construction, not by policy:
 
----
+- **Secrets are scrubbed before disk write.** Tokens, passwords, API keys, bearer headers, JWT blobs, and high-entropy strings are detected and replaced with `<redacted>` in memory. Redacted commands are never suggested.
+- **Leading-space commands and `-deny` patterns are never recorded.**
+- **The socket is `0600`** and lives in `$XDG_RUNTIME_DIR`. No TCP listener exists.
+- **Command history is never sent to an LLM**, even if one is configured. The synthesizer's only input is `(tool name, public documentation text)`. No user data can reach the payload — there is no parameter for it.
+- **Non-localhost LLM endpoints** are announced loudly in the harvest log. Home paths are scrubbed from documentation text before it leaves the process.
+- **`ariadne forget <regex>`** deletes from memory and rewrites the on-disk event log.
 
-## Latency
+<br>
 
-The budget *is* the architecture: keystroke→ghost p50 3ms / p99 10ms / 20ms hard
-timeout → fall through to native. Measured on 50k-command synthetic history:
+## Limitations
+
+Ariadne is opinionated about what it's good at. Honest limitations:
+
+- **Bash port deltas.** The bash integration needs a socket bridge, only supports the emacs keymap, and uses raw ANSI for ghost text (no `POSTDISPLAY` equivalent in bash). Multi-line prompts disable painting, and non-ASCII input doesn't re-query until the next bound keystroke.
+- **Fish** is designed but not built yet.
+- **Multi-host merge** is not implemented. Each host learns independently.
+- **Carapace values** (dynamic completions like `kubectl get <resource>`) aren't consumed live — Ariadne records that Carapace covers the tool but delegates dynamic value completion to the shell.
+- **Subcommand completion** fires only at a fresh token (`tool ␣<TAB>`), not mid-typing (`tool ch<TAB>`).
+- **LLM-synthesized specs can hallucinate** despite strict validation. Synthesis is off by default and incremental — coverage of the long tail improves over days, not instantly.
+- **The dumbest version** (trie + cwd-frecency, no ML) already captures most of the value. The learned ranker has to beat that baseline on your data. Check `ariadne stats` to see whether it does.
+
+<br>
+
+## Project Structure
 
 ```
-entries=50000  p50=0.16ms  p90=0.51ms  p99=1.72ms  max=11.19ms
+cmd/ariadne/          CLI client (stats, doctor, bench, query, forget)
+cmd/ariadned/         Daemon binary (socket-activated systemd user service)
+internal/
+  core/               Domain types: Event, Hash, normalization, redaction
+  daemon/             Socket listener, ingest loop, query dispatch, ownership logic
+  harvest/            Tool spec scraping (carapace, fish, zsh, man, --help, LLM synthesis)
+  index/              Lock-free atomic index, prefix/fuzzy search, match quality scoring
+  proto/              Wire protocol (text line-based + JSON framing)
+  rank/               17-feature logistic model + FTRL-Proximal trainer
+  store/              JSONL event log + gob snapshot persistence
+shell/ariadne.zsh     ZLE widget integration (zsh/net/socket, no per-keystroke fork)
+shell/ariadne.bash    Bash integration (bind -x + coproc, PS0 cleanup)
+systemd/              ariadned.service + ariadned.socket (user-scoped)
+dist/                 Prebuilt linux-amd64 / linux-arm64 binaries
 ```
 
-Run `ariadne bench` on your own data.
+All Go code is in `internal/` except the two `cmd/` entry points. Each package owns its full vertical slice. Zero external dependencies — the `go.mod` has no `require` blocks.
 
----
+<br>
 
-## Architecture
+## Contributing
 
+The latency budget is 3ms p50 / 10ms p99 / 20ms hard timeout per keystroke. PRs touching the hot path should include `ariadne bench` output. New dependencies must be justified — the binary ships as a single static file, and every import is a permanent tax.
+
+Run the full test suite before submitting:
+
+```bash
+go test -race ./...
+go vet ./...
 ```
-zsh (ZLE) / bash (readline)  ──unix socket, text proto──▶  ariadned (Go)
-  ghost + panel                                    atomic.Pointer[Index]  ← lock-free reads
-  ownership-gated Tab                              ingest chan → fold → rebuild
-  circuit breaker                                  background: harvest, train, snapshot
-  fall through to native                           JSONL log + gob snapshot (Store iface)
-```
-
-The design rationale lives in the package doc comments — start with
-`internal/daemon/daemon.go` (ownership, ingest) and `internal/rank/rank.go`
-(features, FTRL trainer).
-
----
-
-## Limitations (honest)
-
-- **bash port deltas**: the bash integration (`shell/ariadne.bash`) requires
-  bash ≥ 5 and a socket bridge (`socat`, openbsd `nc`, or `ncat`), and supports
-  the **emacs keymap only** — `set -o vi` keeps history learning but loses the
-  live layer. Ghost text and the panel are painted with raw ANSI (bash has no
-  POSTDISPLAY), so non-ASCII input, bracketed paste, and unbound editing keys
-  don't re-query until the next bound keystroke, and multi-line prompts/buffers
-  disable painting (Tab still works). Lines that fail to parse (e.g. a lone
-  `do`) are invisible to both shells' hook mechanisms and are never ingested.
-- **fish** is designed but not built.
-- **Multi-host merge** is not implemented; each host learns independently.
-- **carapace values** (dynamic completions) aren't consumed live yet — Ariadne
-  records that carapace covers a tool but delegates dynamic value completion to
-  the shell.
-- The **panel may not earn its place**. Ghost text is nearly free; a 3-line
-  panel below every prompt costs attention (and, in bash, a few scrollback
-  rows per command). Acceptance-by-rank is tracked in `stats` — if rows 2
-  and 3 are rarely chosen, set `ARIADNE_PANEL_LINES=0`.
-- **Subcommand suggestions fire only at a fresh token** (`tool ␣<TAB>`), not
-  on a typed prefix (`tool ch<TAB>`). This applies to every spec source,
-  not just LLM-synthesized ones.
-- **LLM-synthesized specs can hallucinate** despite strict name validation —
-  treat their flags as hints, and prefer endpoints you control. Synthesis is
-  off by default and incremental (up to `ARIADNE_LLM_MAXTOOLS` per 12h
-  harvest), so coverage of the long tail improves over days, not instantly.
-- The **dumbest version** (trie + cwd-frecency, no ML) already captures much of
-  the value. The learned ranker has to beat that baseline on your data to
-  justify itself; `stats` shows whether it does.

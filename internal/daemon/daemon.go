@@ -858,6 +858,11 @@ func (d *Daemon) runHarvest(ctx context.Context) {
 	if d.cfg.Verbose {
 		opt.Log = func(f string, a ...any) { log.Printf("harvest: "+f, a...) }
 	}
+	// The previous specs make LLM synthesis idempotent: the map is only ever
+	// replaced wholesale, never mutated, so handing it over unlocked is safe.
+	d.br.mu.Lock()
+	opt.Prev = d.br.tools
+	d.br.mu.Unlock()
 	hctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	res, err := harvest.Run(hctx, opt)

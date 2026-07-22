@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,7 +42,11 @@ type Options struct {
 	ManDirs          []string
 	Blacklist        []*regexp.Regexp
 	LLM              LLMOptions
-	Log              func(string, ...any)
+	// Prev carries the specs from the previous run. Only the LLM source
+	// consumes it: synthesis is the one source that costs tokens and model
+	// time, so it is also the one that must be idempotent across runs.
+	Prev map[string]*core.ToolSpec
+	Log  func(string, ...any)
 }
 
 func DefaultOptions() Options {
@@ -135,6 +140,38 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 		res.Specs[s.Name] = s
 	}
 
+	// Seed unchanged LLM specs before any source runs. Seeded specs cost
+	// nothing (no tokens, no execs), make coverage stable across runs, and
+	// still lose to any deterministic source with higher confidence — but
+	// not to the --help regex, which they outrank.
+	seeded := 0
+	for name, prev := range opt.Prev {
+		if prev.Source != "llm" {
+			continue
+		}
+		path, ok := bins[name]
+		if !ok || binaryChanged(path, prev.BinMTime) {
+			continue // gone from PATH, or binary changed: rediscover fresh
+		}
+		res.Specs[name] = prev
+		seeded++
+	}
+	if seeded > 0 {
+		opt.Log("llm: %d specs carried over from previous harvest", seeded)
+	}
+
+	// Deterministic coverage order: map iteration is random, which would
+	// otherwise flap the --help and LLM budgets between different tools
+	// every run.
+	sortedNames := func() []string {
+		names := make([]string, 0, len(bins))
+		for n := range bins {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return names
+	}()
+
 	// 1. carapace: highest confidence, fully structured.
 	for _, s := range harvestCarapace(ctx, bins) {
 		add(s)
@@ -162,7 +199,7 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 	// 4. man page roff SOURCE (not rendered text: rendering destroys the
 	//    structure that makes parsing tractable).
 	n0 = len(res.Specs)
-	for name := range bins {
+	for _, name := range sortedNames {
 		if _, have := res.Specs[name]; have {
 			continue
 		}
@@ -189,7 +226,7 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 	if opt.AllowHelpExec {
 		n0 = len(res.Specs)
 		execs := 0
-		for name, path := range bins {
+		for _, name := range sortedNames {
 			if _, have := res.Specs[name]; have {
 				continue
 			}
@@ -199,6 +236,7 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 			if blacklisted(name, opt.Blacklist) {
 				continue
 			}
+			path := bins[name]
 			if opt.PackageOwnedOnly && !packageOwned(path) {
 				continue
 			}
@@ -223,7 +261,7 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 		}
 		n0 = len(res.Specs)
 		attempts := 0
-		for name, path := range bins {
+		for _, name := range sortedNames {
 			if _, have := res.Specs[name]; have {
 				continue
 			}
@@ -233,6 +271,7 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 			if blacklisted(name, opt.Blacklist) {
 				continue
 			}
+			path := bins[name]
 			// man text first (complete, authoritative); --help as fallback.
 			text := ""
 			if p := findManPage(name, opt.ManDirs); p != "" {
@@ -257,6 +296,9 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 				}
 				continue
 			}
+			if info, serr := os.Stat(path); serr == nil {
+				spec.BinMTime = info.ModTime().Unix()
+			}
 			add(spec)
 			select {
 			case <-ctx.Done():
@@ -267,6 +309,17 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 		opt.Log("llm: +%d specs from %d attempts", len(res.Specs)-n0, attempts)
 	}
 	return res, nil
+}
+
+// binaryChanged reports whether the binary at path has a different mtime
+// than the spec was synthesized from. Stat failure means "assume changed":
+// re-synthesizing once is cheaper than trusting a stale spec forever.
+func binaryChanged(path string, mtime int64) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	return info.ModTime().Unix() != mtime
 }
 
 func blacklisted(name string, bl []*regexp.Regexp) bool {
