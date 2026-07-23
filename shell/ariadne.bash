@@ -710,11 +710,12 @@ _ariadne_init() {
 
   _ariadne_install_insert_bindings
 
-  # DEL (Backspace, 0x7f): readline notation is \\d, not \\C? or \\C-?.
-  # Without a valid binding the key falls through to native backward-delete-
-  # char -- the character disappears but stale suggestions are never cleared.
-  bind -m emacs -x '"\d": _ariadne_backward_delete_char' 2>/dev/null
-  bind -m emacs -x '"\C-h": _ariadne_backward_delete_char' 2>/dev/null
+  # DEL (Backspace, 0x7f): \\177 is the portable octal readline notation.
+  # \\d / \\C-? are documented alternatives but fail silently on some bash
+  # builds. Without a working binding the key falls through to native
+  # backward-delete-char and stale suggestions are never refreshed.
+  bind -m emacs -x '"\177": _ariadne_backward_delete_char'
+  bind -m emacs -x '"\C-h": _ariadne_backward_delete_char'
   bind -m emacs -x '"\e[3~": _ariadne_delete_char'
   bind -m emacs -x '"\C-w": _ariadne_backward_kill_word'
   bind -m emacs -x '"\C-k": _ariadne_kill_line'
