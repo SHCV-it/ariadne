@@ -476,14 +476,20 @@ _ariadne_insert() {
 }
 
 _ariadne_backward_delete_char() {
-  (( READLINE_POINT == 0 )) && return 0
+  if (( READLINE_POINT == 0 )); then
+    _ariadne_after_edit
+    return 0
+  fi
   READLINE_LINE="${READLINE_LINE:0:READLINE_POINT-1}${READLINE_LINE:READLINE_POINT}"
   (( READLINE_POINT -= 1 ))
   _ariadne_after_edit
 }
 
 _ariadne_delete_char() {
-  (( READLINE_POINT >= ${#READLINE_LINE} )) && return 0
+  if (( READLINE_POINT >= ${#READLINE_LINE} )); then
+    _ariadne_after_edit
+    return 0
+  fi
   READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}${READLINE_LINE:READLINE_POINT+1}"
   _ariadne_after_edit
 }
@@ -704,18 +710,21 @@ _ariadne_init() {
 
   _ariadne_install_insert_bindings
 
-  bind -m emacs -x '"\C?": _ariadne_backward_delete_char' 2>/dev/null
+  # DEL (Backspace, 0x7f): readline notation is \\d, not \\C? or \\C-?.
+  # Without a valid binding the key falls through to native backward-delete-
+  # char -- the character disappears but stale suggestions are never cleared.
+  bind -m emacs -x '"\d": _ariadne_backward_delete_char' 2>/dev/null
   bind -m emacs -x '"\C-h": _ariadne_backward_delete_char' 2>/dev/null
-  bind -m emacs -x '"\e[3~": _ariadne_delete_char' 2>/dev/null
-  bind -m emacs -x '"\C-w": _ariadne_backward_kill_word' 2>/dev/null
-  bind -m emacs -x '"\C-k": _ariadne_kill_line' 2>/dev/null
-  bind -m emacs -x '"\C-l": _ariadne_clear_screen' 2>/dev/null
-  bind -m emacs -x '"\e[C": _ariadne_accept_suggestion' 2>/dev/null  # Right
-  bind -m emacs -x '"\eOC": _ariadne_accept_suggestion' 2>/dev/null  # Right (application)
-  bind -m emacs -x '"\C-f": _ariadne_accept_suggestion' 2>/dev/null
-  bind -m emacs -x '"\e1": _ariadne_select_1' 2>/dev/null            # Alt-1
-  bind -m emacs -x '"\e2": _ariadne_select_2' 2>/dev/null
-  bind -m emacs -x '"\e3": _ariadne_select_3' 2>/dev/null
+  bind -m emacs -x '"\e[3~": _ariadne_delete_char'
+  bind -m emacs -x '"\C-w": _ariadne_backward_kill_word'
+  bind -m emacs -x '"\C-k": _ariadne_kill_line'
+  bind -m emacs -x '"\C-l": _ariadne_clear_screen'
+  bind -m emacs -x '"\e[C": _ariadne_accept_suggestion'
+  bind -m emacs -x '"\eOC": _ariadne_accept_suggestion'
+  bind -m emacs -x '"\C-f": _ariadne_accept_suggestion'
+  bind -m emacs -x '"\e1": _ariadne_select_1'
+  bind -m emacs -x '"\e2": _ariadne_select_2'
+  bind -m emacs -x '"\e3": _ariadne_select_3'
 
   # hooks. precmd must be first (it reads $?) and arm must be last (so the
   # DEBUG trap only fires for the user's command, not the prompt machinery).
