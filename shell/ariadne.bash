@@ -760,6 +760,13 @@ _ariadne_init() {
 
   _ariadne_chpwd
   _ariadne_measure_prompt
+
+  # Spawn the socket bridge now, while bash is still sourcing files — before
+  # readline ever processes a keystroke. Doing it lazily inside a bind -x
+  # handler meant a coproc fork (with all its terminal-state juggling) ran
+  # in the middle of readline's own dispatch; on a fresh boot that race could
+  # leave the terminal in a broken state where keystrokes no longer echo.
+  _ariadne_connect
 }
 
 typeset -g _ARIADNE_PREV_DEBUG=""
