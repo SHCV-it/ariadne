@@ -36,7 +36,11 @@ func boot(t *testing.T) (*Daemon, string, func()) {
 	d.br.onPath = map[string]bool{"git": true, "kubectl": true, "rg": true, "docker": true}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go d.Serve(ctx)
+	serveDone := make(chan struct{})
+	go func() {
+		d.Serve(ctx)
+		close(serveDone)
+	}()
 	for i := 0; i < 100; i++ {
 		if c, err := net.Dial("unix", sock); err == nil {
 			c.Close()
@@ -44,7 +48,16 @@ func boot(t *testing.T) (*Daemon, string, func()) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return d, sock, cancel
+	return d, sock, func() {
+		cancel()
+		// Serve() runs shutdown() (final snapshot + store close) on cancel;
+		// the TempDir cleanup must not race those file writes.
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+			t.Log("daemon did not stop within 5s")
+		}
+	}
 }
 
 func rpc(t *testing.T, sock string, req *proto.Request) *proto.Response {
@@ -428,4 +441,41 @@ func keys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Re-importing the same history must not double-count commands. Without this,
+// every `ariadne import` after the first inflates frecency and dilutes the
+// failure signal with duplicate successes.
+func TestImportIdempotent(t *testing.T) {
+	d, sock, stop := boot(t)
+	defer stop()
+
+	evs := []*core.Event{
+		{Raw: "git status", Norm: "git status", Argv0: "git", Host: "testhost", ExitCode: 0, TS: 1000},
+		{Raw: "herdr session attach neuromark-platform", Norm: "herdr session attach neuromark-platform",
+			Argv0: "herdr", Host: "testhost", ExitCode: 0, TS: 2000},
+	}
+	if got := d.ImportHistory(evs); got != 2 {
+		t.Fatalf("first import: got %d, want 2", got)
+	}
+	// Same file re-imported (e.g. after new shell history was appended).
+	if got := d.ImportHistory(evs); got != 0 {
+		t.Fatalf("re-import: got %d, want 0 (idempotent)", got)
+	}
+
+	resp := rpc(t, sock, &proto.Request{
+		Op: proto.OpQuery, Buffer: "git status", Cursor: 10,
+		Cwd: "/", Host: "testhost", Session: "q", Limit: 5,
+	})
+	if len(resp.Candidates) != 1 {
+		t.Fatalf("expected exactly 1 candidate, got %d", len(resp.Candidates))
+	}
+
+	// A genuinely new command still imports.
+	extra := []*core.Event{
+		{Raw: "git log", Norm: "git log", Argv0: "git", Host: "testhost", ExitCode: 0, TS: 3000},
+	}
+	if got := d.ImportHistory(extra); got != 1 {
+		t.Fatalf("new import: got %d, want 1", got)
+	}
 }

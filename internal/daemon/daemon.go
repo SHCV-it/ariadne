@@ -288,8 +288,10 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		ln.Close()
 	}()
 
+	d.br.mu.Lock()
 	log.Printf("ariadned: listening on %s (%d entries, %d tools)",
 		d.cfg.SocketPath, len(d.br.entries), len(d.br.tools))
+	d.br.mu.Unlock()
 
 	for {
 		c, err := ln.Accept()
@@ -957,6 +959,11 @@ func sign(f float64) float64 {
 func (d *Daemon) doImport(evs []*core.Event) *proto.Response {
 	n := 0
 	d.br.mu.Lock()
+	var fresh []*core.Event
+	// Hashes applied within this batch. Duplicate lines in one history file
+	// are real repeat executions and must each count; only commands already
+	// known before this import starts are skipped (idempotent re-import).
+	applied := make(map[core.Hash]bool)
 	for _, e := range evs {
 		if e == nil || strings.TrimSpace(e.Raw) == "" {
 			continue
@@ -968,14 +975,26 @@ func (d *Daemon) doImport(evs []*core.Event) *proto.Response {
 		e.Raw = red
 		e.Norm = core.Normalize(red)
 		e.Argv0 = core.Argv0(e.Norm)
+		if e.Norm == "" {
+			continue
+		}
 		if e.TS == 0 {
 			e.TS = time.Now().Unix()
 		}
+		h := e.Hash()
+		if _, ok := d.br.entries[h]; ok && !applied[h] {
+			// Already known from live ingest or an earlier import — do not
+			// count it again. Without this, every re-import inflates counts
+			// and dilutes the failure signal with duplicate successes.
+			continue
+		}
 		d.apply(e)
 		n++
+		applied[h] = true
+		fresh = append(fresh, e)
 	}
 	d.br.mu.Unlock()
-	for _, e := range evs {
+	for _, e := range fresh {
 		if e.Norm != "" {
 			d.st.AppendEvent(e)
 		}
@@ -1040,16 +1059,27 @@ func (d *Daemon) rewriteLog(re *regexp.Regexp) error {
 // ImportHistory bulk-loads an existing shell history file.
 func (d *Daemon) ImportHistory(events []*core.Event) int {
 	d.br.mu.Lock()
+	var fresh []*core.Event
+	applied := make(map[core.Hash]bool)
 	for _, e := range events {
+		if e == nil || e.Norm == "" {
+			continue
+		}
+		h := e.Hash()
+		if _, ok := d.br.entries[h]; ok && !applied[h] {
+			continue // idempotent — see doImport
+		}
 		d.apply(e)
+		fresh = append(fresh, e)
+		applied[h] = true
 	}
 	d.br.mu.Unlock()
-	for _, e := range events {
+	for _, e := range fresh {
 		d.st.AppendEvent(e)
 	}
 	d.rebuild()
 	d.snapshot()
-	return len(events)
+	return len(fresh)
 }
 
 func (d *Daemon) Entries() int {
