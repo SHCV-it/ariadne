@@ -426,17 +426,25 @@ func parseHistory(path, host string) ([]*core.Event, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 
+	// Two passes: we need the line count to spread imported timestamps across
+	// the 90-day window. bash/fish history carries no timestamps; zsh extended
+	// history does.
+	var rawLines []string
+	for sc.Scan() {
+		rawLines = append(rawLines, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
 	var out []*core.Event
 	base := filepath.Base(path)
 	isFish := strings.Contains(base, "fish_history")
 	now := time.Now().Unix()
-	// Imported history has no timestamps in the bash case and no exit codes
-	// anywhere. Spread it over the past 90 days so decay does not treat the
-	// whole import as simultaneous.
-	seq := 0
+	window := int64(90 * 24 * 3600)
+	total := len(rawLines)
 
-	for sc.Scan() {
-		line := sc.Text()
+	for i, line := range rawLines {
 		var cmd string
 		var ts int64
 
@@ -463,9 +471,16 @@ func parseHistory(path, host string) ([]*core.Event, error) {
 		if cmd == "" || strings.HasPrefix(cmd, "#") {
 			continue
 		}
-		seq++
 		if ts == 0 {
-			ts = now - int64(90*24*3600) + int64(seq)
+			// Spread by line position: later lines are more recent. A naive
+			// now-90d+seq put every imported command within ~500 seconds of
+			// exactly 90 days back, so imported history always ranked at
+			// maximum decay no matter when it was actually run.
+			if total > 1 {
+				ts = now - window + int64(float64(i)*float64(window)/float64(total-1))
+			} else {
+				ts = now
+			}
 		}
 		norm := core.Normalize(cmd)
 		out = append(out, &core.Event{
@@ -473,7 +488,7 @@ func parseHistory(path, host string) ([]*core.Event, error) {
 			Host: host, TS: ts, ExitCode: 0, Session: "import",
 		})
 	}
-	return out, sc.Err()
+	return out, nil
 }
 
 func gitRoot(dir string) string {
