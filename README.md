@@ -126,6 +126,11 @@ go build -o ~/.local/bin/ariadned ./cmd/ariadned
 go build -o ~/.local/bin/ariadne  ./cmd/ariadne
 
 # 2. Install and start the daemon (socket-activated user service)
+#    The shipped unit sets the daemon's PATH to include ~/.local/bin — the
+#    daemon's tool-presence feature and harvest scan use its PATH, and a
+#    systemd default PATH would make every ~/.local/bin tool (herdr, ariadne,
+#    …) invisible: their candidates lose the tool_present boost and never
+#    get a tool spec. If you override ExecStart or PATH, keep ~/.local/bin.
 install -Dm644 systemd/ariadned.service ~/.config/systemd/user/ariadned.service
 install -Dm644 systemd/ariadned.socket  ~/.config/systemd/user/ariadned.socket
 systemctl --user daemon-reload

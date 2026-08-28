@@ -9,6 +9,13 @@ ExecStart=%h/.local/bin/ariadned
 Restart=on-failure
 RestartSec=2
 
+# systemd's default PATH omits ~/.local/bin, where this project installs its
+# own binaries (and where many user tools live). The daemon's tool-presence
+# feature and the harvest PATH scan both use this PATH, so without it every
+# candidate whose binary sits in ~/.local/bin (herdr, …) silently loses the
+# tool_present boost and never gets a tool spec harvested.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.local/kitty.app/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/cuda/bin:/usr/lib/jvm/default/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl
+
 # The daemon holds your shell history. Confine it accordingly. These also
 # provide the process sandbox the harvester needs when it shells out to
 # systemd-run for --help scraping.
