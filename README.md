@@ -212,7 +212,7 @@ Environment=ARIADNE_LLM_MAXTOOLS=20
 Ariadne is a local tool built for people who care about what leaves their machine. Every privacy decision is enforced by construction, not by policy:
 
 - **Secrets are scrubbed before disk write.** Tokens, passwords, API keys, bearer headers, JWT blobs, and high-entropy strings are detected and replaced with `<redacted>` in memory. Redacted commands are never suggested.
-- **Leading-space commands and `-deny` patterns are never recorded.**
+- **Leading-space commands and `-deny` patterns are never recorded.** Ariadne also never records its own administration commands (`ariadne forget/import/stats/...`) — that pattern is a built-in default and `-deny` extends it.
 - **The socket is `0600`** and lives in `$XDG_RUNTIME_DIR`. No TCP listener exists.
 - **Command history is never sent to an LLM**, even if one is configured. The synthesizer's only input is `(tool name, public documentation text)`. No user data can reach the payload — there is no parameter for it.
 - **Non-localhost LLM endpoints** are announced loudly in the harvest log. Home paths are scrubbed from documentation text before it leaves the process.

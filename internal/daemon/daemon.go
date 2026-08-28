@@ -54,6 +54,11 @@ func DefaultConfig() Config {
 		MinTrainSamples: 500,
 		HarvestOnStart:  true,
 		MaxSessionCmds:  20,
+		// The daemon must not record its own administration commands
+		// (ariadne forget/import/stats/...). They are meta noise that would
+		// otherwise pollute the very history they manage. The -deny flag
+		// appends additional patterns.
+		Deny: []*regexp.Regexp{regexp.MustCompile(`^ariadne `)},
 	}
 }
 
